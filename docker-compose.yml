@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  credit-risk-api:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+    environment:
+      - ENV=production
+
