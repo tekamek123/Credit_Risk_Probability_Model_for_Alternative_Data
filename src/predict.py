@@ -89,6 +89,37 @@ class CreditRiskPredictor:
         Returns:
             Array of risk probabilities (0-1)
         """
+        # Use MLflow model if available
+        if self.mlflow_model is not None:
+            # Process data
+            if self.processor is None:
+                # Initialize processor if not loaded
+                self.processor = CreditRiskDataProcessor()
+            X, _ = self.processor.process_data_from_df(data, is_training=False)
+            
+            # MLflow models expect DataFrame input
+            try:
+                # Try to get probabilities
+                if hasattr(self.mlflow_model, 'predict_proba'):
+                    probabilities = self.mlflow_model.predict_proba(X)[:, 1]
+                elif hasattr(self.mlflow_model, 'predict'):
+                    # Get predictions and convert to probabilities
+                    predictions = self.mlflow_model.predict(X)
+                    probabilities = predictions.astype(float)
+                else:
+                    # Use pyfunc interface
+                    probabilities = self.mlflow_model.predict(X)
+                    if probabilities.ndim > 1:
+                        probabilities = probabilities[:, 1] if probabilities.shape[1] > 1 else probabilities[:, 0]
+            except Exception as e:
+                # Fallback: try direct prediction
+                probabilities = self.mlflow_model.predict(X)
+                if isinstance(probabilities, pd.DataFrame):
+                    probabilities = probabilities.values.flatten()
+            
+            return np.array(probabilities)
+        
+        # Fallback to local model
         if model_name is None:
             model_name = self.model_name
         
@@ -96,6 +127,8 @@ class CreditRiskPredictor:
             self.load_models(model_name)
         
         # Process data
+        if self.processor is None:
+            raise ValueError("Processor not loaded. Cannot process data.")
         X, _ = self.processor.process_data_from_df(data, is_training=False)
         
         # Scale features
