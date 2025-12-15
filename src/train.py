@@ -60,14 +60,20 @@ class MLflowContext:
         self.context = None
     
     def __enter__(self):
-        if MLFLOW_AVAILABLE:
-            self.context = mlflow.start_run(run_name=self.run_name)
-            self.context.__enter__()
+        if MLFLOW_AVAILABLE and mlflow:
+            try:
+                self.context = mlflow.start_run(run_name=self.run_name)
+            except Exception:
+                # If MLflow is not properly initialized, continue without it
+                self.context = None
         return self
     
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.context:
-            self.context.__exit__(exc_type, exc_val, exc_tb)
+        if self.context and MLFLOW_AVAILABLE and mlflow:
+            try:
+                mlflow.end_run()
+            except Exception:
+                pass
 
 
 class CreditRiskModelTrainer:
@@ -154,23 +160,38 @@ class CreditRiskModelTrainer:
         print(f"  Train set: {X_train.shape[0]} samples, {X_train.shape[1]} features")
         print(f"  Test set: {X_test.shape[0]} samples")
         
-        # Scale features
+        # Scale features (only numeric columns)
         print("\n[3/6] Scaling features...")
-        X_train_scaled = self.scaler.fit_transform(X_train)
-        X_test_scaled = self.scaler.transform(X_test)
+        # Select only numeric columns for scaling
+        numeric_cols = X_train.select_dtypes(include=[np.number]).columns.tolist()
+        X_train_numeric = X_train[numeric_cols]
+        X_test_numeric = X_test[numeric_cols]
+        
+        X_train_scaled = self.scaler.fit_transform(X_train_numeric)
+        X_test_scaled = self.scaler.transform(X_test_numeric)
         
         # Convert back to DataFrame to preserve column names
-        X_train_scaled = pd.DataFrame(X_train_scaled, columns=X_train.columns, index=X_train.index)
-        X_test_scaled = pd.DataFrame(X_test_scaled, columns=X_test.columns, index=X_test.index)
+        X_train_scaled = pd.DataFrame(X_train_scaled, columns=numeric_cols, index=X_train.index)
+        X_test_scaled = pd.DataFrame(X_test_scaled, columns=numeric_cols, index=X_test.index)
+        
+        # Add back non-numeric columns if any
+        non_numeric_cols = [col for col in X_train.columns if col not in numeric_cols]
+        if non_numeric_cols:
+            X_train_scaled = pd.concat([X_train_scaled, X_train[non_numeric_cols]], axis=1)
+            X_test_scaled = pd.concat([X_test_scaled, X_test[non_numeric_cols]], axis=1)
         
         # Train models with MLflow tracking
         print("\n[4/6] Training models with MLflow tracking...")
         results = {}
         
+        # Ensure we only use numeric columns for all models
+        X_train_numeric = X_train_scaled.select_dtypes(include=[np.number])
+        X_test_numeric = X_test_scaled.select_dtypes(include=[np.number])
+        
         # 1. Logistic Regression
         print("\n  [1/5] Training Logistic Regression...")
         lr_result = self._train_logistic_regression(
-            X_train_scaled, y_train, X_test_scaled, y_test,
+            X_train_numeric, y_train, X_test_numeric, y_test,
             use_hyperparameter_tuning, tuning_method
         )
         results['logistic_regression'] = lr_result
@@ -178,7 +199,7 @@ class CreditRiskModelTrainer:
         # 2. Decision Tree
         print("\n  [2/5] Training Decision Tree...")
         dt_result = self._train_decision_tree(
-            X_train, y_train, X_test, y_test,
+            X_train_numeric, y_train, X_test_numeric, y_test,
             use_hyperparameter_tuning, tuning_method
         )
         results['decision_tree'] = dt_result
@@ -186,7 +207,7 @@ class CreditRiskModelTrainer:
         # 3. Random Forest
         print("\n  [3/5] Training Random Forest...")
         rf_result = self._train_random_forest(
-            X_train, y_train, X_test, y_test,
+            X_train_numeric, y_train, X_test_numeric, y_test,
             use_hyperparameter_tuning, tuning_method
         )
         results['random_forest'] = rf_result
@@ -194,7 +215,7 @@ class CreditRiskModelTrainer:
         # 4. XGBoost
         print("\n  [4/5] Training XGBoost...")
         xgb_result = self._train_xgboost(
-            X_train, y_train, X_test, y_test,
+            X_train_numeric, y_train, X_test_numeric, y_test,
             use_hyperparameter_tuning, tuning_method
         )
         results['xgboost'] = xgb_result
@@ -203,7 +224,7 @@ class CreditRiskModelTrainer:
         if LIGHTGBM_AVAILABLE:
             print("\n  [5/5] Training LightGBM...")
             lgb_result = self._train_lightgbm(
-                X_train, y_train, X_test, y_test,
+                X_train_numeric, y_train, X_test_numeric, y_test,
                 use_hyperparameter_tuning, tuning_method
             )
             results['lightgbm'] = lgb_result
@@ -216,7 +237,8 @@ class CreditRiskModelTrainer:
         
         # Register best model in MLflow Model Registry
         print("\n[6/6] Registering best model in MLflow Model Registry...")
-        self._register_best_model(X_test_scaled if self.best_model_name == 'logistic_regression' else X_test, y_test)
+        X_test_for_registry = X_test_scaled.select_dtypes(include=[np.number]) if self.best_model_name == 'logistic_regression' else X_test_numeric
+        self._register_best_model(X_test_for_registry, y_test)
         
         # Summary
         print("\n" + "="*80)
@@ -359,10 +381,11 @@ class CreditRiskModelTrainer:
             metrics = self._calculate_metrics(y_test, y_pred, y_pred_proba)
             
             # Log to MLflow
-            mlflow.log_params(best_params)
-            mlflow.log_metrics(metrics)
-            mlflow.log_param("model_type", "DecisionTreeClassifier")
-            mlflow.sklearn.log_model(model, "model")
+            if MLFLOW_AVAILABLE and mlflow and mlflow.active_run():
+                mlflow.log_params(best_params)
+                mlflow.log_metrics(metrics)
+                mlflow.log_param("model_type", "DecisionTreeClassifier")
+                mlflow.sklearn.log_model(model, "model")
             
             self.models['decision_tree'] = model
             self.metrics['decision_tree'] = metrics
@@ -423,10 +446,11 @@ class CreditRiskModelTrainer:
             metrics = self._calculate_metrics(y_test, y_pred, y_pred_proba)
             
             # Log to MLflow
-            mlflow.log_params(best_params)
-            mlflow.log_metrics(metrics)
-            mlflow.log_param("model_type", "RandomForestClassifier")
-            mlflow.sklearn.log_model(model, "model")
+            if MLFLOW_AVAILABLE and mlflow and mlflow.active_run():
+                mlflow.log_params(best_params)
+                mlflow.log_metrics(metrics)
+                mlflow.log_param("model_type", "RandomForestClassifier")
+                mlflow.sklearn.log_model(model, "model")
             
             self.models['random_forest'] = model
             self.metrics['random_forest'] = metrics
@@ -494,10 +518,11 @@ class CreditRiskModelTrainer:
             metrics = self._calculate_metrics(y_test, y_pred, y_pred_proba)
             
             # Log to MLflow
-            mlflow.log_params(best_params)
-            mlflow.log_metrics(metrics)
-            mlflow.log_param("model_type", "XGBClassifier")
-            mlflow.xgboost.log_model(model, "model")
+            if MLFLOW_AVAILABLE and mlflow and mlflow.active_run():
+                mlflow.log_params(best_params)
+                mlflow.log_metrics(metrics)
+                mlflow.log_param("model_type", "XGBClassifier")
+                mlflow.xgboost.log_model(model, "model")
             
             self.models['xgboost'] = model
             self.metrics['xgboost'] = metrics
@@ -565,10 +590,11 @@ class CreditRiskModelTrainer:
             metrics = self._calculate_metrics(y_test, y_pred, y_pred_proba)
             
             # Log to MLflow
-            mlflow.log_params(best_params)
-            mlflow.log_metrics(metrics)
-            mlflow.log_param("model_type", "LGBMClassifier")
-            mlflow.lightgbm.log_model(model, "model")
+            if MLFLOW_AVAILABLE and mlflow and mlflow.active_run():
+                mlflow.log_params(best_params)
+                mlflow.log_metrics(metrics)
+                mlflow.log_param("model_type", "LGBMClassifier")
+                mlflow.lightgbm.log_model(model, "model")
             
             self.models['lightgbm'] = model
             self.metrics['lightgbm'] = metrics
