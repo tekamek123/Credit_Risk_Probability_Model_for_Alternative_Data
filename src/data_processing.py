@@ -15,6 +15,7 @@ from sklearn.pipeline import Pipeline, FeatureUnion
 from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler, LabelEncoder, OneHotEncoder
 from sklearn.impute import SimpleImputer, KNNImputer
 from sklearn.compose import ColumnTransformer
+from sklearn.cluster import KMeans
 
 try:
     from xverse.transformer import WOE
@@ -328,6 +329,7 @@ class CreditRiskDataProcessor:
         self.pipeline = None
         self.scaler = None
         self.target_col = 'is_high_risk'
+        self.rfm_cluster_info_ = None
         
     def load_data(self, file_path: str) -> pd.DataFrame:
         """Load transaction data from CSV file."""
@@ -335,34 +337,169 @@ class CreditRiskDataProcessor:
         df['TransactionStartTime'] = pd.to_datetime(df['TransactionStartTime'])
         return df
     
-    def create_proxy_variable(self, df: pd.DataFrame) -> pd.DataFrame:
+    def create_proxy_variable(
+        self, 
+        df: pd.DataFrame, 
+        n_clusters: int = 3,
+        random_state: int = 42
+    ) -> pd.DataFrame:
         """
-        Create proxy variable for credit risk (high risk = 1, low risk = 0).
-        Uses RFM patterns and fraud indicators.
+        Create proxy variable for credit risk using K-Means clustering on RFM metrics.
+        
+        Steps:
+        1. Calculate RFM metrics (Recency, Frequency, Monetary) for each customer
+        2. Scale RFM features for clustering
+        3. Apply K-Means clustering to segment customers into 3 groups
+        4. Identify high-risk cluster (lowest engagement - low frequency and monetary)
+        5. Create binary is_high_risk target variable
+        
+        Args:
+            df: Transaction DataFrame
+            n_clusters: Number of clusters for K-Means (default: 3)
+            random_state: Random state for reproducibility (default: 42)
+            
+        Returns:
+            DataFrame with is_high_risk column added
         """
-        # Calculate customer-level features
-        customer_features = self._calculate_customer_features(df)
+        # Ensure TransactionStartTime is datetime
+        if not pd.api.types.is_datetime64_any_dtype(df['TransactionStartTime']):
+            df['TransactionStartTime'] = pd.to_datetime(df['TransactionStartTime'])
         
-        # Define high risk criteria
-        has_fraud = customer_features['has_fraud'] == 1
-        low_engagement = (customer_features['recency_days'] > 30) & (customer_features['transaction_count'] < 5)
-        high_volatility = (customer_features['amount_std'] > customer_features['amount_mean']) & (customer_features['amount_mean'] < 1000)
-        declining_pattern = customer_features['recent_transaction_ratio'] < 0.5
+        # Step 1: Calculate RFM Metrics
+        rfm_df = self._calculate_rfm_metrics(df)
         
-        # Combine criteria
-        customer_features['is_high_risk'] = (
-            has_fraud | low_engagement | high_volatility | declining_pattern
-        ).astype(int)
+        # Check if we have enough customers for clustering
+        n_customers = len(rfm_df)
+        actual_n_clusters = min(n_clusters, n_customers)
+        
+        if n_customers < n_clusters:
+            # Not enough customers for clustering - assign all to low risk
+            rfm_df['cluster'] = 0
+            rfm_df['is_high_risk'] = 0
+            
+            # Store minimal cluster info
+            self.rfm_cluster_info_ = {
+                'cluster_summary': pd.DataFrame(),
+                'high_risk_cluster': None,
+                'cluster_centers': None,
+                'scaler': None,
+                'warning': f'Not enough customers ({n_customers}) for {n_clusters} clusters. All assigned to low risk.'
+            }
+            
+            # Reset index and merge
+            rfm_df = rfm_df.reset_index()
+            df = df.merge(
+                rfm_df[['CustomerId', 'is_high_risk', 'Recency', 'Frequency', 'Monetary', 'cluster']],
+                on='CustomerId',
+                how='left'
+            )
+            df['is_high_risk'] = df['is_high_risk'].fillna(0).astype(int)
+            return df
+        
+        # Step 2: Pre-process (scale) RFM features for clustering
+        rfm_features = ['Recency', 'Frequency', 'Monetary']
+        scaler = StandardScaler()
+        rfm_scaled = scaler.fit_transform(rfm_df[rfm_features])
+        rfm_scaled_df = pd.DataFrame(
+            rfm_scaled,
+            columns=rfm_features,
+            index=rfm_df.index
+        )
+        
+        # Step 3: Apply K-Means clustering
+        kmeans = KMeans(n_clusters=actual_n_clusters, random_state=random_state, n_init=10)
+        rfm_df['cluster'] = kmeans.fit_predict(rfm_scaled_df)
+        
+        # Step 4: Analyze clusters to identify high-risk group
+        # High-risk = least engaged = low frequency and low monetary value
+        cluster_summary = rfm_df.groupby('cluster')[['Frequency', 'Monetary']].mean()
+        
+        # Calculate engagement score (lower is worse = higher risk)
+        # Weight frequency and monetary equally
+        cluster_summary['engagement_score'] = (
+            cluster_summary['Frequency'] / cluster_summary['Frequency'].max() +
+            cluster_summary['Monetary'] / cluster_summary['Monetary'].max()
+        ) / 2
+        
+        # Identify high-risk cluster (lowest engagement score)
+        high_risk_cluster = cluster_summary['engagement_score'].idxmin()
+        
+        # Step 5: Create binary target variable
+        rfm_df['is_high_risk'] = (rfm_df['cluster'] == high_risk_cluster).astype(int)
+        
+        # Reset index to get CustomerId as column
+        rfm_df = rfm_df.reset_index()
+        
+        # Store cluster information for reference
+        self.rfm_cluster_info_ = {
+            'cluster_summary': cluster_summary,
+            'high_risk_cluster': high_risk_cluster,
+            'cluster_centers': kmeans.cluster_centers_,
+            'scaler': scaler
+        }
         
         # Merge back to transaction level
         df = df.merge(
-            customer_features[['CustomerId', 'is_high_risk']],
+            rfm_df[['CustomerId', 'is_high_risk', 'Recency', 'Frequency', 'Monetary', 'cluster']],
             on='CustomerId',
             how='left'
         )
+        
+        # Fill any missing values (shouldn't happen, but safety check)
         df['is_high_risk'] = df['is_high_risk'].fillna(0).astype(int)
         
         return df
+    
+    def _calculate_rfm_metrics(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Calculate RFM (Recency, Frequency, Monetary) metrics for each customer.
+        
+        Args:
+            df: Transaction DataFrame
+            
+        Returns:
+            DataFrame with CustomerId, Recency, Frequency, Monetary
+        """
+        # Define snapshot date (most recent transaction date + 1 day)
+        snapshot_date = df['TransactionStartTime'].max() + pd.Timedelta(days=1)
+        
+        # Calculate RFM metrics
+        rfm = df.groupby('CustomerId').agg({
+            'TransactionStartTime': lambda x: (snapshot_date - x.max()).days,  # Recency (days since last transaction)
+            'TransactionId': 'count',  # Frequency (number of transactions)
+            'Amount': 'sum'  # Monetary (total transaction amount)
+        }).reset_index()
+        
+        # Rename columns
+        rfm.columns = ['CustomerId', 'Recency', 'Frequency', 'Monetary']
+        
+        # Ensure Monetary is positive (use absolute value if needed, or keep as is)
+        # For credit risk, we might want to consider both positive and negative amounts
+        # For now, we'll use the sum as is (negative amounts might indicate refunds/credits)
+        # But for clustering, we'll use absolute value to focus on transaction volume
+        rfm['Monetary'] = rfm['Monetary'].abs()
+        
+        # Handle edge cases
+        # If Recency is 0 (transaction today), set to 1 to avoid log issues
+        rfm['Recency'] = rfm['Recency'].replace(0, 1)
+        
+        # If Frequency is 0 (shouldn't happen), set to 1
+        rfm['Frequency'] = rfm['Frequency'].replace(0, 1)
+        
+        # If Monetary is 0, set to a small positive value
+        rfm['Monetary'] = rfm['Monetary'].replace(0, 0.01)
+        
+        return rfm.set_index('CustomerId')
+    
+    def get_cluster_info(self) -> Optional[Dict]:
+        """
+        Get information about the RFM clusters created during proxy variable generation.
+        
+        Returns:
+            Dictionary with cluster summary, high-risk cluster ID, and cluster centers
+            None if clustering hasn't been performed yet
+        """
+        return self.rfm_cluster_info_
     
     def _calculate_customer_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """Calculate customer-level features for RFM analysis."""
@@ -546,17 +683,21 @@ class CreditRiskDataProcessor:
                 print(f"  {col}: {iv:.4f}")
         
         # Separate features and target
+        # Exclude ID columns, target, and RFM/cluster columns (these are intermediate, not features)
+        exclude_cols = [
+            'CustomerId', 'AccountId', 'SubscriptionId', 
+            'TransactionId', 'BatchId', self.target_col,
+            'Recency', 'Frequency', 'Monetary', 'cluster'  # RFM and cluster are not features
+        ]
+        
         if is_training:
-            # Drop ID columns and target
             feature_cols = [col for col in df_transformed.columns 
-                          if col not in ['CustomerId', 'AccountId', 'SubscriptionId', 
-                                        'TransactionId', 'BatchId', self.target_col]]
+                          if col not in exclude_cols]
             X = df_transformed[feature_cols]
             y = df_transformed[self.target_col] if self.target_col in df_transformed.columns else None
         else:
             feature_cols = [col for col in df_transformed.columns 
-                          if col not in ['CustomerId', 'AccountId', 'SubscriptionId', 
-                                        'TransactionId', 'BatchId']]
+                          if col not in exclude_cols]
             X = df_transformed[feature_cols]
             y = None
         
@@ -624,9 +765,14 @@ class CreditRiskDataProcessor:
             df_transformed = self.pipeline.transform(df)
         
         # Separate features and target
+        # Exclude ID columns, target, and RFM/cluster columns
+        exclude_cols = [
+            'CustomerId', 'AccountId', 'SubscriptionId', 
+            'TransactionId', 'BatchId', self.target_col,
+            'Recency', 'Frequency', 'Monetary', 'cluster'  # RFM and cluster are not features
+        ]
         feature_cols = [col for col in df_transformed.columns 
-                      if col not in ['CustomerId', 'AccountId', 'SubscriptionId', 
-                                    'TransactionId', 'BatchId', self.target_col]]
+                      if col not in exclude_cols]
         X = df_transformed[feature_cols]
         
         if is_training and self.target_col in df_transformed.columns:

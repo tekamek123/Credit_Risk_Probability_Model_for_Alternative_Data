@@ -92,28 +92,72 @@ class TestDataLoading:
 
 
 class TestProxyVariable:
-    """Tests for proxy variable creation."""
+    """Tests for proxy variable creation using K-Means clustering."""
     
     def test_create_proxy_variable(self, processor, sample_transaction_data):
-        """Test proxy variable creation."""
-        df = processor.create_proxy_variable(sample_transaction_data)
+        """Test proxy variable creation using K-Means clustering."""
+        df = processor.create_proxy_variable(sample_transaction_data, n_clusters=3, random_state=42)
         
+        # Check that is_high_risk column exists
         assert 'is_high_risk' in df.columns
         assert df['is_high_risk'].dtype in [int, np.int64]
         assert df['is_high_risk'].isin([0, 1]).all()
+        
+        # Check that RFM metrics are present
+        assert 'Recency' in df.columns
+        assert 'Frequency' in df.columns
+        assert 'Monetary' in df.columns
+        assert 'cluster' in df.columns
+        
+        # Check that cluster info is stored
+        cluster_info = processor.get_cluster_info()
+        assert cluster_info is not None
+        assert 'high_risk_cluster' in cluster_info
+        assert 'cluster_summary' in cluster_info
+        assert 'cluster_centers' in cluster_info
     
-    def test_proxy_variable_with_fraud(self, processor, sample_transaction_data):
-        """Test that customers with fraud are marked as high risk."""
-        # Add fraud to one customer
-        sample_transaction_data.loc[0, 'FraudResult'] = 1
+    def test_rfm_metrics_calculation(self, processor, sample_transaction_data):
+        """Test that RFM metrics are calculated correctly."""
+        df = processor.create_proxy_variable(sample_transaction_data, n_clusters=3, random_state=42)
         
-        df = processor.create_proxy_variable(sample_transaction_data)
+        # Check RFM metrics are positive
+        assert (df['Recency'] >= 0).all()
+        assert (df['Frequency'] > 0).all()
+        assert (df['Monetary'] > 0).all()
         
-        # Customer with fraud should be high risk
-        fraud_customer = df[df['FraudResult'] == 1]['CustomerId'].iloc[0]
-        customer_risk = df[df['CustomerId'] == fraud_customer]['is_high_risk'].iloc[0]
+        # Check that each customer has RFM values
+        assert df['Recency'].notna().all()
+        assert df['Frequency'].notna().all()
+        assert df['Monetary'].notna().all()
+    
+    def test_kmeans_clustering(self, processor, sample_transaction_data):
+        """Test that K-Means clustering creates 3 distinct clusters."""
+        df = processor.create_proxy_variable(sample_transaction_data, n_clusters=3, random_state=42)
         
-        assert customer_risk == 1
+        # Check that cluster column exists and has 3 unique values
+        unique_clusters = df['cluster'].unique()
+        assert len(unique_clusters) == 3
+        assert set(unique_clusters).issubset({0, 1, 2})
+        
+        # Check that high-risk cluster is identified
+        cluster_info = processor.get_cluster_info()
+        high_risk_cluster = cluster_info['high_risk_cluster']
+        assert high_risk_cluster in [0, 1, 2]
+        
+        # Check that high-risk customers are in the identified cluster
+        high_risk_customers = df[df['is_high_risk'] == 1]
+        if len(high_risk_customers) > 0:
+            assert (high_risk_customers['cluster'] == high_risk_cluster).all()
+    
+    def test_proxy_variable_reproducibility(self, processor, sample_transaction_data):
+        """Test that proxy variable creation is reproducible with same random_state."""
+        df1 = processor.create_proxy_variable(sample_transaction_data, n_clusters=3, random_state=42)
+        processor2 = CreditRiskDataProcessor()
+        df2 = processor2.create_proxy_variable(sample_transaction_data, n_clusters=3, random_state=42)
+        
+        # Check that high-risk assignments are the same
+        assert (df1['is_high_risk'] == df2['is_high_risk']).all()
+        assert (df1['cluster'] == df2['cluster']).all()
 
 
 class TestAggregateFeatures:
