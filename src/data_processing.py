@@ -686,7 +686,8 @@ class CreditRiskDataProcessor:
         # Exclude ID columns, target, and RFM/cluster columns (these are intermediate, not features)
         exclude_cols = [
             'CustomerId', 'AccountId', 'SubscriptionId', 
-            'TransactionId', 'BatchId', self.target_col,
+            'TransactionId', 'BatchId', 'ProductId',  # ProductId is an ID, not a feature
+            self.target_col,
             'Recency', 'Frequency', 'Monetary', 'cluster'  # RFM and cluster are not features
         ]
         
@@ -768,7 +769,8 @@ class CreditRiskDataProcessor:
         # Exclude ID columns, target, and RFM/cluster columns
         exclude_cols = [
             'CustomerId', 'AccountId', 'SubscriptionId', 
-            'TransactionId', 'BatchId', self.target_col,
+            'TransactionId', 'BatchId', 'ProductId',  # ProductId is an ID, not a feature
+            self.target_col,
             'Recency', 'Frequency', 'Monetary', 'cluster'  # RFM and cluster are not features
         ]
         feature_cols = [col for col in df_transformed.columns 
