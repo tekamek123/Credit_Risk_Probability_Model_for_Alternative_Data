@@ -1,12 +1,14 @@
 """
 FastAPI application for credit risk model inference.
+Loads best model from MLflow Model Registry.
 """
 
 from fastapi import FastAPI, HTTPException, status
 from fastapi.responses import JSONResponse
-from typing import List
+from typing import List, Optional
 import pandas as pd
 import sys
+import os
 from pathlib import Path
 
 # Add parent directory to path for imports
@@ -18,6 +20,14 @@ from src.api.pydantic_models import (
     LoanRecommendation, HealthResponse, ErrorResponse
 )
 
+# Try to import MLflow
+try:
+    import mlflow
+    MLFLOW_AVAILABLE = True
+except ImportError:
+    MLFLOW_AVAILABLE = False
+    mlflow = None
+
 # Initialize FastAPI app
 app = FastAPI(
     title="Credit Risk Prediction API",
@@ -28,17 +38,59 @@ app = FastAPI(
 # Initialize predictor (lazy loading)
 predictor: CreditRiskPredictor = None
 
+# MLflow configuration
+MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "file:./mlruns")
+MLFLOW_MODEL_NAME = os.getenv("MLFLOW_MODEL_NAME", "CreditRiskModel")
+
+
+def load_model_from_mlflow(model_name: str = "CreditRiskModel") -> Optional[object]:
+    """
+    Load model from MLflow Model Registry.
+    
+    Args:
+        model_name: Name of the model in MLflow registry
+        
+    Returns:
+        Loaded model or None if MLflow is not available
+    """
+    if not MLFLOW_AVAILABLE:
+        return None
+    
+    try:
+        # Set tracking URI
+        mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+        
+        # Load model from registry
+        model_uri = f"models:/{model_name}/latest"
+        model = mlflow.pyfunc.load_model(model_uri)
+        return model
+    except Exception as e:
+        print(f"Failed to load model from MLflow: {e}")
+        return None
+
 
 def get_predictor() -> CreditRiskPredictor:
     """Get or initialize predictor (singleton pattern)."""
     global predictor
     if predictor is None:
         predictor = CreditRiskPredictor(model_dir="models")
-        try:
-            predictor.load_models('logistic_regression')
-        except FileNotFoundError:
-            # Models not trained yet
-            pass
+        
+        # Try to load from MLflow first
+        mlflow_model = load_model_from_mlflow(MLFLOW_MODEL_NAME)
+        if mlflow_model is not None:
+            # Store MLflow model
+            predictor.mlflow_model = mlflow_model
+            predictor.model_source = "mlflow"
+            print(f"Loaded model from MLflow registry: {MLFLOW_MODEL_NAME}")
+        else:
+            # Fallback to local models
+            try:
+                predictor.load_models('logistic_regression')
+                predictor.model_source = "local"
+            except FileNotFoundError:
+                # Models not trained yet
+                predictor.model_source = None
+                pass
     return predictor
 
 
@@ -46,10 +98,20 @@ def get_predictor() -> CreditRiskPredictor:
 async def root():
     """Root endpoint - health check."""
     pred = get_predictor()
-    models_loaded = list(pred.models.keys()) if pred.models else []
+    
+    # Check model availability
+    if pred.mlflow_model is not None:
+        models_loaded = [f"MLflow:{MLFLOW_MODEL_NAME}"]
+        status_val = "healthy"
+    elif pred.models:
+        models_loaded = list(pred.models.keys())
+        status_val = "healthy"
+    else:
+        models_loaded = []
+        status_val = "models_not_loaded"
     
     return HealthResponse(
-        status="healthy" if models_loaded else "models_not_loaded",
+        status=status_val,
         models_loaded=models_loaded,
         version="1.0.0"
     )
@@ -65,6 +127,7 @@ async def health():
 async def predict(request: PredictionRequest):
     """
     Predict credit risk for given transactions.
+    Loads best model from MLflow registry or falls back to local models.
     
     Args:
         request: Prediction request with transactions
@@ -76,8 +139,15 @@ async def predict(request: PredictionRequest):
         # Get predictor
         pred = get_predictor()
         
-        # Check if model is loaded
-        if request.model_name not in pred.models:
+        # Check if model is available
+        if pred.mlflow_model is None and not pred.models:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="No model available. Please train and register a model first."
+            )
+        
+        # If using local models and model not loaded, try to load it
+        if pred.mlflow_model is None and request.model_name not in pred.models:
             try:
                 pred.load_models(request.model_name)
             except FileNotFoundError:
@@ -94,9 +164,11 @@ async def predict(request: PredictionRequest):
         df['TransactionStartTime'] = pd.to_datetime(df['TransactionStartTime'])
         
         # Make predictions
+        # Use model_name from request if provided, otherwise use default
+        model_to_use = request.model_name if pred.mlflow_model is None else None
         predictions_df = pred.predict(
             df,
-            model_name=request.model_name,
+            model_name=model_to_use,
             include_recommendations=request.include_recommendations
         )
         
@@ -120,9 +192,12 @@ async def predict(request: PredictionRequest):
                 )
             )
         
+        # Determine which model was used
+        model_used = f"MLflow:{MLFLOW_MODEL_NAME}" if pred.mlflow_model else request.model_name
+        
         return PredictionResponse(
             predictions=predictions,
-            model_used=request.model_name,
+            model_used=model_used,
             total_customers=len(predictions)
         )
         
