@@ -1,5 +1,5 @@
 """
-Unit tests for data processing module.
+Unit tests for data processing module with sklearn Pipeline.
 """
 
 import pytest
@@ -12,7 +12,14 @@ from pathlib import Path
 # Add src to path
 sys.path.append(str(Path(__file__).parent.parent))
 
-from src.data_processing import CreditRiskDataProcessor
+from src.data_processing import (
+    CreditRiskDataProcessor,
+    AggregateFeatureTransformer,
+    TemporalFeatureExtractor,
+    CategoricalEncoder,
+    MissingValueHandler,
+    WOETransformer
+)
 
 
 @pytest.fixture
@@ -45,7 +52,7 @@ def sample_transaction_data():
 @pytest.fixture
 def processor():
     """Create a CreditRiskDataProcessor instance."""
-    return CreditRiskDataProcessor()
+    return CreditRiskDataProcessor(use_woe=False, encoding_type='onehot')
 
 
 class TestDataLoading:
@@ -109,107 +116,164 @@ class TestProxyVariable:
         assert customer_risk == 1
 
 
-class TestFeatureEngineering:
-    """Tests for feature engineering."""
+class TestAggregateFeatures:
+    """Tests for aggregate feature transformer."""
     
-    def test_engineer_features(self, processor, sample_transaction_data):
-        """Test feature engineering."""
-        df = processor.engineer_features(sample_transaction_data, is_training=True)
+    def test_aggregate_transformer(self, sample_transaction_data):
+        """Test AggregateFeatureTransformer."""
+        transformer = AggregateFeatureTransformer()
+        transformer.fit(sample_transaction_data)
+        df_transformed = transformer.transform(sample_transaction_data)
         
-        # Check RFM features
-        assert 'recency_days' in df.columns
-        assert 'frequency' in df.columns
-        assert 'monetary' in df.columns
+        # Check required aggregate features
+        assert 'total_amount' in df_transformed.columns
+        assert 'avg_amount' in df_transformed.columns
+        assert 'transaction_count' in df_transformed.columns
+        assert 'amount_std' in df_transformed.columns
         
-        # Check temporal features
-        assert 'year' in df.columns
-        assert 'month' in df.columns
-        assert 'day_of_week' in df.columns
-        assert 'hour' in df.columns
-        assert 'is_weekend' in df.columns
-        
-        # Check transaction features
-        assert 'is_debit' in df.columns
-        assert 'is_credit' in df.columns
-        assert 'amount_log' in df.columns
-    
-    def test_categorical_encoding(self, processor, sample_transaction_data):
-        """Test categorical encoding."""
-        df = processor.engineer_features(sample_transaction_data, is_training=True)
-        
-        # Check that encoders are created
-        assert 'ProductCategory' in processor.categorical_encoders
-        assert 'ChannelId' in processor.categorical_encoders
-        
-        # Check encoded features exist
-        assert 'product_category_fraud_rate' in df.columns
-        assert 'channel_fraud_rate' in df.columns
+        # Check that values are calculated correctly
+        assert df_transformed['total_amount'].notna().all()
+        assert df_transformed['transaction_count'].notna().all()
 
 
-class TestFeatureSelection:
-    """Tests for feature selection."""
+class TestTemporalFeatures:
+    """Tests for temporal feature extractor."""
     
-    def test_select_features(self, processor, sample_transaction_data):
-        """Test feature selection."""
-        # First engineer features
-        df = processor.engineer_features(sample_transaction_data, is_training=True)
+    def test_temporal_extractor(self, sample_transaction_data):
+        """Test TemporalFeatureExtractor."""
+        transformer = TemporalFeatureExtractor()
+        transformer.fit(sample_transaction_data)
+        df_transformed = transformer.transform(sample_transaction_data)
         
-        # Then select features
-        selected_df = processor.select_features(df)
+        # Check required temporal features
+        assert 'transaction_hour' in df_transformed.columns
+        assert 'transaction_day' in df_transformed.columns
+        assert 'transaction_month' in df_transformed.columns
+        assert 'transaction_year' in df_transformed.columns
         
-        # Check that feature columns are set
-        assert processor.feature_columns is not None
-        assert len(processor.feature_columns) > 0
-        
-        # Check that selected DataFrame has correct columns
-        assert 'CustomerId' in selected_df.columns
-        assert 'is_high_risk' in selected_df.columns
-        assert all(col in selected_df.columns for col in processor.feature_columns)
-    
-    def test_feature_selection_no_nan(self, processor, sample_transaction_data):
-        """Test that selected features have no NaN values."""
-        df = processor.engineer_features(sample_transaction_data, is_training=True)
-        selected_df = processor.select_features(df)
-        
-        # Check for NaN in feature columns
-        feature_cols = [col for col in processor.feature_columns if col in selected_df.columns]
-        assert selected_df[feature_cols].isnull().sum().sum() == 0
+        # Check value ranges
+        assert df_transformed['transaction_hour'].between(0, 23).all()
+        assert df_transformed['transaction_day'].between(1, 31).all()
+        assert df_transformed['transaction_month'].between(1, 12).all()
+        assert df_transformed['transaction_year'].min() >= 2018
 
 
-class TestDataProcessingPipeline:
-    """Tests for complete data processing pipeline."""
+class TestCategoricalEncoding:
+    """Tests for categorical encoding."""
+    
+    def test_onehot_encoding(self, sample_transaction_data):
+        """Test One-Hot encoding."""
+        encoder = CategoricalEncoder(
+            columns=['ProductCategory', 'ChannelId'],
+            encoding_type='onehot'
+        )
+        encoder.fit(sample_transaction_data)
+        df_encoded = df_encoded = encoder.transform(sample_transaction_data)
+        
+        # Check that original columns are removed
+        assert 'ProductCategory' not in df_encoded.columns
+        assert 'ChannelId' not in df_encoded.columns
+        
+        # Check that encoded columns exist
+        encoded_cols = [col for col in df_encoded.columns 
+                       if 'ProductCategory' in col or 'ChannelId' in col]
+        assert len(encoded_cols) > 0
+    
+    def test_label_encoding(self, sample_transaction_data):
+        """Test Label encoding."""
+        encoder = CategoricalEncoder(
+            columns=['ProductCategory'],
+            encoding_type='label'
+        )
+        encoder.fit(sample_transaction_data)
+        df_encoded = encoder.transform(sample_transaction_data)
+        
+        # Check that encoded column exists
+        assert 'ProductCategory_encoded' in df_encoded.columns
+        assert df_encoded['ProductCategory_encoded'].dtype in [int, np.int64]
+
+
+class TestMissingValueHandling:
+    """Tests for missing value handling."""
+    
+    def test_missing_value_imputation(self, sample_transaction_data):
+        """Test missing value imputation."""
+        # Add some missing values
+        sample_transaction_data.loc[0:5, 'Amount'] = np.nan
+        
+        handler = MissingValueHandler(strategy='mean')
+        handler.fit(sample_transaction_data)
+        df_imputed = handler.transform(sample_transaction_data)
+        
+        # Check that missing values are filled
+        assert df_imputed['Amount'].notna().all()
+    
+    def test_missing_value_removal(self, sample_transaction_data):
+        """Test missing value removal."""
+        # Add many missing values to one column
+        sample_transaction_data.loc[0:60, 'Amount'] = np.nan
+        
+        handler = MissingValueHandler(strategy='remove', columns=['Amount'])
+        handler.fit(sample_transaction_data)
+        df_cleaned = handler.transform(sample_transaction_data)
+        
+        # Check that missing values are handled
+        # If column was dropped (>50% missing), it won't be in df_cleaned
+        # If column was kept, missing values should be removed via row removal
+        if 'Amount' in df_cleaned.columns:
+            assert df_cleaned['Amount'].notna().all()
+        else:
+            # Column was dropped due to high missing percentage
+            assert True
+
+
+class TestPipeline:
+    """Tests for complete sklearn Pipeline."""
+    
+    def test_pipeline_build(self, processor):
+        """Test pipeline building."""
+        pipeline = processor.build_pipeline()
+        
+        assert pipeline is not None
+        assert len(pipeline.steps) > 0
+        assert 'temporal' in [step[0] for step in pipeline.steps]
+        assert 'aggregate' in [step[0] for step in pipeline.steps]
+        assert 'missing_values' in [step[0] for step in pipeline.steps]
+        assert 'categorical' in [step[0] for step in pipeline.steps] or 'woe' in [step[0] for step in pipeline.steps]
     
     def test_process_data_training(self, processor, tmp_path):
         """Test complete processing pipeline for training."""
         # Create test data file
         sample_data = pd.DataFrame({
-            'TransactionId': ['T1', 'T2', 'T3'],
-            'BatchId': ['B1', 'B2', 'B3'],
-            'AccountId': ['A1', 'A2', 'A3'],
-            'SubscriptionId': ['S1', 'S2', 'S3'],
-            'CustomerId': ['C1', 'C1', 'C2'],
-            'CurrencyCode': ['UGX'] * 3,
-            'CountryCode': [256] * 3,
-            'ProviderId': ['P1', 'P2', 'P1'],
-            'ProductId': ['Prod1', 'Prod2', 'Prod1'],
-            'ProductCategory': ['airtime', 'utility', 'airtime'],
-            'ChannelId': ['Ch1', 'Ch2', 'Ch1'],
-            'Amount': [1000.0, -500.0, 2000.0],
-            'Value': [1000, 500, 2000],
+            'TransactionId': ['T1', 'T2', 'T3', 'T4', 'T5'],
+            'BatchId': ['B1', 'B2', 'B3', 'B4', 'B5'],
+            'AccountId': ['A1', 'A2', 'A3', 'A4', 'A5'],
+            'SubscriptionId': ['S1', 'S2', 'S3', 'S4', 'S5'],
+            'CustomerId': ['C1', 'C1', 'C2', 'C2', 'C3'],
+            'CurrencyCode': ['UGX'] * 5,
+            'CountryCode': [256] * 5,
+            'ProviderId': ['P1', 'P2', 'P1', 'P2', 'P1'],
+            'ProductId': ['Prod1', 'Prod2', 'Prod1', 'Prod2', 'Prod1'],
+            'ProductCategory': ['airtime', 'utility', 'airtime', 'utility', 'airtime'],
+            'ChannelId': ['Ch1', 'Ch2', 'Ch1', 'Ch2', 'Ch1'],
+            'Amount': [1000.0, -500.0, 2000.0, 1500.0, 3000.0],
+            'Value': [1000, 500, 2000, 1500, 3000],
             'TransactionStartTime': [
                 '2018-11-15T02:18:49Z',
                 '2018-11-16T02:18:49Z',
-                '2018-11-17T02:18:49Z'
+                '2018-11-17T02:18:49Z',
+                '2018-11-18T02:18:49Z',
+                '2018-11-19T02:18:49Z'
             ],
-            'PricingStrategy': [2, 2, 2],
-            'FraudResult': [0, 0, 1]
+            'PricingStrategy': [2, 2, 2, 2, 2],
+            'FraudResult': [0, 0, 1, 0, 0]
         })
         
         csv_path = tmp_path / "test_data.csv"
         sample_data.to_csv(csv_path, index=False)
         
         # Process data
-        X, y = processor.process_data(str(csv_path), is_training=True)
+        X, y = processor.process_data(str(csv_path), is_training=True, scaling_method='standard')
         
         # Check outputs
         assert X is not None
@@ -217,6 +281,53 @@ class TestDataProcessingPipeline:
         assert len(X) == len(y)
         assert len(X.columns) > 0
         assert y.isin([0, 1]).all()
+        
+        # Check that aggregate features are present
+        assert any('total_amount' in str(col) or 'avg_amount' in str(col) or 
+                  'transaction_count' in str(col) for col in X.columns)
+        
+        # Check that temporal features are present
+        assert any('hour' in str(col) or 'day' in str(col) or 
+                  'month' in str(col) or 'year' in str(col) for col in X.columns)
+        
+        # Check that scaling is applied
+        assert processor.scaler is not None
+    
+    def test_process_data_inference(self, processor, tmp_path):
+        """Test processing pipeline for inference (no target)."""
+        # Create test data file
+        sample_data = pd.DataFrame({
+            'TransactionId': ['T1', 'T2'],
+            'BatchId': ['B1', 'B2'],
+            'AccountId': ['A1', 'A2'],
+            'SubscriptionId': ['S1', 'S2'],
+            'CustomerId': ['C1', 'C2'],
+            'CurrencyCode': ['UGX', 'UGX'],
+            'CountryCode': [256, 256],
+            'ProviderId': ['P1', 'P2'],
+            'ProductId': ['Prod1', 'Prod2'],
+            'ProductCategory': ['airtime', 'utility'],
+            'ChannelId': ['Ch1', 'Ch2'],
+            'Amount': [1000.0, -500.0],
+            'Value': [1000, 500],
+            'TransactionStartTime': ['2018-11-15T02:18:49Z', '2018-11-16T02:18:49Z'],
+            'PricingStrategy': [2, 2],
+            'FraudResult': [0, 0]
+        })
+        
+        csv_path = tmp_path / "test_data.csv"
+        sample_data.to_csv(csv_path, index=False)
+        
+        # First fit on training data
+        processor.process_data(str(csv_path), is_training=True)
+        
+        # Then transform for inference
+        X, y = processor.process_data(str(csv_path), is_training=False)
+        
+        # Check outputs
+        assert X is not None
+        assert y is None  # No target for inference
+        assert len(X.columns) > 0
 
 
 if __name__ == "__main__":

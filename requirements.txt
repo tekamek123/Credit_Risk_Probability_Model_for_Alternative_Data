@@ -16,6 +16,10 @@ plotly>=5.14.0
 scipy>=1.10.0
 statsmodels>=0.14.0
 
+# WoE/IV Transformation
+xverse>=0.1.0
+woe>=0.1.4
+
 # API
 fastapi>=0.100.0
 uvicorn>=0.23.0
@@ -33,4 +37,5 @@ pytest-cov>=4.1.0
 jupyter>=1.0.0
 notebook>=6.5.0
 ipykernel>=6.25.0
+
 
