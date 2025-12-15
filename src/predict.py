@@ -34,6 +34,8 @@ class CreditRiskPredictor:
         self.processor = None
         self.feature_names = None
         self.model_name = 'logistic_regression'  # Default model
+        self.mlflow_model = None  # MLflow model
+        self.model_source = None  # 'mlflow' or 'local'
         
     def load_models(self, model_name: str = 'logistic_regression'):
         """
